@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+import re
+
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
@@ -173,13 +175,16 @@ def _sub_list(data: dict) -> list[dict]:
 def _subs_rows(subs: list[dict]) -> str:
     if not subs:
         return texts.SUBS_NONE
-    return "\n".join(f"• {texts.chat_link(s['title'], s.get('username'))}" for s in subs)
+    mark = texts.t(texts.SUB_POST_MARK)
+    return "\n".join(f"• {texts.chat_link(s['title'], s.get('username'))}{mark if s.get('post') else ''}"
+                     for s in subs)
 
 
 async def show_subs(message: Message, state: FSMContext, edit: bool = False) -> None:
     data = await state.get_data()
     text = texts.t(texts.STEP_SUBS, rows=_subs_rows(_sub_list(data)))
-    markup = keyboards.subs(bool(data.get("own_sub")), data["chat_title"], len(data.get("extra", [])))
+    extras = [s for s in data.get("extra", []) if s["chat_id"] != data["chat_id"]]
+    markup = keyboards.subs(bool(data.get("own_sub")), data["chat_title"], extras)
     if edit:
         try:
             await message.edit_text(text, reply_markup=markup, link_preview_options={"is_disabled": True})
@@ -204,30 +209,83 @@ async def clear_subs(call: CallbackQuery, state: FSMContext) -> None:
     await show_subs(call.message, state, edit=True)
 
 
-@router.message(Wizard.subs, F.chat_shared.request_id == keyboards.REQ_SUB)
-async def add_sub(message: Message, state: FSMContext, bot: Bot) -> None:
+_LINK = re.compile(r"^(?:https?://)?(?:t\.me|telegram\.me)/([A-Za-z0-9_]{4,32})/?$|^@?([A-Za-z0-9_]{4,32})$")
+
+
+async def _add_sub(message: Message, state: FSMContext, bot: Bot, ref, fallback_title: str | None) -> None:
     data = await state.get_data()
-    chat_id = message.chat_shared.chat_id
     if len(_sub_list(data)) >= config.MAX_SUBS:
         await message.answer(texts.t(texts.SUBS_FULL, max=config.MAX_SUBS))
         return
+    try:
+        chat = await bot.get_chat(ref)
+    except TelegramBadRequest:
+        await message.answer(texts.t(texts.SUB_BAD_NAME))
+        return
+    title = chat.title or fallback_title or "канал"
     # Проверять подписку на канал бот может, только будучи там админом:
     # иначе getChatMember отвечает ошибкой, и проверка молча пропускала бы всех.
     try:
-        chat = await bot.get_chat(chat_id)
-        me = await bot.get_chat_member(chat_id, bot.id)
+        me = await bot.get_chat_member(chat.id, bot.id)
         ok = me.status in {"administrator", "creator"}
     except TelegramBadRequest:
-        chat, ok = None, False
-    title = (chat.title if chat else None) or message.chat_shared.title or "канал"
+        ok = False
     if not ok:
-        await message.answer(texts.t(texts.CHANNEL_NO_RIGHTS, title=texts.escape(title)))
+        await message.answer(texts.t(texts.SUB_NOT_ADMIN, title=texts.escape(title)))
         return
-    extra = [s for s in data.get("extra", []) if s["chat_id"] != chat_id]
-    extra.append({"chat_id": chat_id, "title": title, "username": chat.username})
+    extra = [s for s in data.get("extra", []) if s["chat_id"] != chat.id]
+    extra.append({"chat_id": chat.id, "title": title, "username": chat.username, "post": False})
     await state.update_data(extra=extra)
     await message.answer(texts.t(texts.SUB_ADDED, title=texts.escape(title)))
     await show_subs(message, state)
+
+
+@router.message(Wizard.subs, F.chat_shared.request_id == keyboards.REQ_SUB)
+async def add_sub(message: Message, state: FSMContext, bot: Bot) -> None:
+    await _add_sub(message, state, bot, message.chat_shared.chat_id, message.chat_shared.title)
+
+
+@router.message(Wizard.subs, NOT_MENU, F.text)
+async def add_sub_by_name(message: Message, state: FSMContext, bot: Bot) -> None:
+    """Спонсорский канал чаще всего чужой: выбрать его кнопкой Telegram не
+    даст (там список только своих админок), а @имя прислать можно всегда."""
+    match = _LINK.match(message.text.strip())
+    if not match:
+        await message.answer(texts.t(texts.SUB_BAD_NAME))
+        return
+    await _add_sub(message, state, bot, "@" + (match.group(1) or match.group(2)), None)
+
+
+@router.callback_query(Wizard.subs, F.data.startswith("w:post:"))
+async def toggle_post(call: CallbackQuery, state: FSMContext, bot: Bot) -> None:
+    chat_id = int(call.data.split(":")[2])
+    data = await state.get_data()
+    extra = data.get("extra", [])
+    sub = next((s for s in extra if s["chat_id"] == chat_id), None)
+    if sub is None:
+        await call.answer()
+        return
+    if not sub.get("post"):
+        # Выкладывать пост в канал может только его админ: иначе любой
+        # пользователь бота постил бы розыгрыши в чужой канал, где солик
+        # оказался админом ради проверки подписки.
+        title = sub["title"]
+        try:
+            me = await bot.get_chat_member(chat_id, bot.id)
+            human = await bot.get_chat_member(chat_id, call.from_user.id)
+        except TelegramBadRequest:
+            await call.answer(texts.POST_NO_RIGHTS.format(title=title)[:200], show_alert=True)
+            return
+        if not (me.status == "creator" or (me.status == "administrator" and getattr(me, "can_post_messages", False))):
+            await call.answer(texts.POST_NO_RIGHTS.format(title=title)[:200], show_alert=True)
+            return
+        if human.status not in {"administrator", "creator"}:
+            await call.answer(texts.POST_NOT_YOURS.format(title=title)[:200], show_alert=True)
+            return
+    sub["post"] = not sub.get("post")
+    await state.update_data(extra=extra)
+    await call.answer()
+    await show_subs(call.message, state, edit=True)
 
 
 @router.callback_query(Wizard.subs, F.data == "w:subdone")
@@ -328,6 +386,9 @@ async def show_preview(message: Message, state: FSMContext) -> None:
         texts.t(texts.PREVIEW, chat=texts.chat_link(data["chat_title"], data.get("chat_username")),
                 winners=data["winners"],
                 subs=", ".join(texts.chat_link(s["title"], s.get("username")) for s in subs) or texts.SUBS_NONE,
+                where=", ".join([texts.chat_link(data["chat_title"], data.get("chat_username"))] + [
+                    texts.chat_link(s["title"], s.get("username")) for s in subs
+                    if s.get("post") and s["chat_id"] != data["chat_id"]]),
                 publish="сразу" if data.get("publish_at") is None else texts.when(publish),
                 end=texts.when(end)),
         reply_markup=keyboards.confirm(), link_preview_options={"is_disabled": True})

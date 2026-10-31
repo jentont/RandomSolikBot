@@ -105,10 +105,41 @@ async def publish(bot: Bot, gid: int) -> bool:
             texts.OWNER_PUBLISH_FAIL, id=gid, chat=_chat(row), error=escape(str(error)[:200])))
         return False
     await db.set_fields(gid, status="active", message_id=message.message_id, publish_at=db.now())
+    await _publish_mirrors(bot, row)
     await _tell(bot, row["owner_id"], texts.t(
         texts.OWNER_PUBLISHED, id=gid, chat=_chat(row), end=texts.when(row["end_at"])),
         link_preview_options={"is_disabled": True})
     return True
+
+
+async def _publish_mirrors(bot: Bot, row) -> None:
+    """Копии поста в каналах спонсоров. Основной пост уже вышел, поэтому
+    отказ спонсорского канала розыгрыш не валит — владелец узнаёт, а
+    кнопка в основном канале продолжает работать."""
+    gid = row["id"]
+    for sub in await db.subs(gid):
+        if not sub["post"] or sub["chat_id"] == row["chat_id"]:
+            continue
+        try:
+            message = await send_post(bot, sub["chat_id"], compose_post(row), row["media_type"],
+                                      row["media_id"], keyboards.join(gid, 0))
+        except Exception as error:
+            log.warning("копия #%s в %s не вышла: %s", gid, sub["chat_id"], error)
+            await _tell(bot, row["owner_id"], texts.t(
+                texts.OWNER_MIRROR_FAIL, id=gid, chat=texts.chat_link(sub["title"], sub["username"]),
+                error=escape(str(error)[:200])), link_preview_options={"is_disabled": True})
+            continue
+        await db.add_post(gid, sub["chat_id"], message.message_id, sub["title"], sub["username"])
+
+
+async def all_posts(row) -> list[dict]:
+    """Все посты розыгрыша: основной первым, потом копии у спонсоров."""
+    out = [{"chat_id": row["chat_id"], "message_id": row["message_id"],
+            "title": row["chat_title"], "username": row["chat_username"], "main": True}]
+    for post in await db.posts(row["id"]):
+        out.append({"chat_id": post["chat_id"], "message_id": post["message_id"],
+                    "title": post["title"], "username": post["username"], "main": False})
+    return [p for p in out if p["message_id"]]
 
 
 # --- участие ----------------------------------------------------------
@@ -165,16 +196,18 @@ async def _refresh_counters(bot: Bot) -> None:
         row = await db.get(gid)
         if row is None or row["status"] != "active":
             continue
-        try:
-            await bot.edit_message_reply_markup(
-                chat_id=row["chat_id"], message_id=row["message_id"],
-                reply_markup=keyboards.join(gid, await db.count_players(gid)))
-        except TelegramRetryAfter as error:
-            _dirty.add(gid)
-            await asyncio.sleep(error.retry_after)
-        except TelegramBadRequest:
-            # «message is not modified» и удалённый пост — счётчик не главное.
-            pass
+        markup = keyboards.join(gid, await db.count_players(gid))
+        for post in await all_posts(row):
+            try:
+                await bot.edit_message_reply_markup(
+                    chat_id=post["chat_id"], message_id=post["message_id"], reply_markup=markup)
+            except TelegramRetryAfter as error:
+                _dirty.add(gid)
+                await asyncio.sleep(error.retry_after)
+                break
+            except TelegramBadRequest:
+                # «message is not modified» и удалённый пост — счётчик не главное.
+                pass
 
 
 # --- итоги ------------------------------------------------------------
@@ -213,6 +246,22 @@ def _winner_rows(winners) -> str:
                      for i, w in enumerate(winners, 1))
 
 
+async def _post_results(bot: Bot, post: dict, text: str, picture: bytes):
+    """Карточка итогов ответом на пост. Возвращает сообщение со списком."""
+    reply = ReplyParameters(message_id=post["message_id"], allow_sending_without_reply=True)
+    message = await bot.send_photo(
+        post["chat_id"], BufferedInputFile(picture, "itogi.jpg"),
+        caption=text if len(text) <= 1024 else None, reply_parameters=reply)
+    if len(text) > 1024:
+        # Сотня победителей в подпись к фото не влезает — тогда картинка
+        # отдельно, список текстом ответом на неё.
+        message = await bot.send_message(
+            post["chat_id"], text, link_preview_options={"is_disabled": True},
+            reply_parameters=ReplyParameters(message_id=message.message_id,
+                                             allow_sending_without_reply=True))
+    return message
+
+
 async def finish(bot: Bot, gid: int) -> bool:
     if not await db.claim(gid, "active", "finishing"):
         return False
@@ -235,36 +284,25 @@ async def finish(bot: Bot, gid: int) -> bool:
         text = texts.t(texts.RESULTS, players=total, winners_block=block,
                        seed=row["seed"], id=gid, bot=_bot_username)
 
-        results_message = None
-        error_text = ""
-        try:
-            results_message = await bot.send_photo(
-                row["chat_id"],
-                BufferedInputFile(card.results(len(winners), total, gid), "itogi.jpg"),
-                caption=text if len(text) <= 1024 else None,
-                reply_parameters=ReplyParameters(message_id=row["message_id"],
-                                                 allow_sending_without_reply=True),
-            )
-            if len(text) > 1024:
-                # Сотня победителей в подпись к фото не влезает — тогда
-                # картинка отдельно, список текстом ответом на неё.
-                results_message = await bot.send_message(
-                    row["chat_id"], text, link_preview_options={"is_disabled": True},
-                    reply_parameters=ReplyParameters(message_id=results_message.message_id,
-                                                     allow_sending_without_reply=True))
-        except Exception as error:
-            log.warning("итоги #%s не вышли в канал: %s", gid, error)
-            error_text = escape(str(error)[:200])
-
+        picture = card.results(len(winners), total, gid)
+        errors = []
+        posts = await all_posts(row)
         await db.set_fields(gid, status="finished")
-        if results_message is not None:
-            url = post_url(row["chat_id"], row["chat_username"], results_message.message_id)
+        for post in posts:
+            try:
+                results_message = await _post_results(bot, post, text, picture)
+            except Exception as error:
+                log.warning("итоги #%s не вышли в %s: %s", gid, post["chat_id"], error)
+                errors.append(f"{texts.chat_link(post['title'], post['username'])}: {escape(str(error)[:150])}")
+                continue
+            url = post_url(post["chat_id"], post["username"], results_message.message_id)
             try:
                 await bot.edit_message_reply_markup(
-                    chat_id=row["chat_id"], message_id=row["message_id"],
+                    chat_id=post["chat_id"], message_id=post["message_id"],
                     reply_markup=keyboards.results_link(total, url, gid))
             except TelegramBadRequest:
                 pass
+        error_text = "; ".join(errors)
 
         owner_text = texts.t(texts.OWNER_DONE, id=gid, players=total, winners_block=block)
         if error_text:
@@ -296,12 +334,13 @@ async def reroll(bot: Bot, gid: int):
     res["pos"] = pos
     await db.set_result(gid, res)
     who = texts.mention(w["user_id"], w["name"], w["username"])
-    try:
-        await bot.send_message(row["chat_id"], texts.t(texts.REROLL_POST, id=gid, who=who),
-                               reply_parameters=ReplyParameters(message_id=row["message_id"],
-                                                                allow_sending_without_reply=True))
-    except Exception as error:
-        log.warning("доп. победитель #%s не вышел в канал: %s", gid, error)
+    for post in await all_posts(row):
+        try:
+            await bot.send_message(post["chat_id"], texts.t(texts.REROLL_POST, id=gid, who=who),
+                                   reply_parameters=ReplyParameters(message_id=post["message_id"],
+                                                                    allow_sending_without_reply=True))
+        except Exception as error:
+            log.warning("доп. победитель #%s не вышел в %s: %s", gid, post["chat_id"], error)
     await _tell(bot, w["user_id"], texts.t(texts.WINNER_DM, chat=_chat(row)),
                 link_preview_options={"is_disabled": True})
     return w

@@ -130,7 +130,7 @@ async def check_flow() -> None:
         "winners": 3, "publish_at": db.now() - 1, "end_at": db.now() + 3600,
         "seed": seed, "seed_hash": draw.fingerprint(seed),
     }, [{"chat_id": CHANNEL, "title": "Solutions", "username": "solutions"},
-        {"chat_id": SPONSOR, "title": "Спонсор", "username": "sponsor"}])
+        {"chat_id": SPONSOR, "title": "Спонсор", "username": "sponsor", "post": True}])
 
     ok(await giveaways.join(bot, gid, user(1)) == texts.JOIN_NOT_YET, "до публикации войти нельзя")
     ok(await giveaways.publish(bot, gid), "розыгрыш опубликован")
@@ -140,6 +140,9 @@ async def check_flow() -> None:
     ok(seed not in post[2], "сам сид в посте не светится")
     row = await db.get(gid)
     ok(row["status"] == "active" and row["message_id"], "статус «идёт», id поста сохранён")
+    mirror = [s for s in bot.sent if s[1] == SPONSOR]
+    ok(len(mirror) == 1 and "join:" in str(mirror[0][3]["reply_markup"]), "копия поста с кнопкой вышла у спонсора")
+    ok(len(await db.posts(gid)) == 1, "копия записана в базу")
 
     for uid in range(1, 11):
         bot.members[(CHANNEL, uid)] = "member"
@@ -158,6 +161,8 @@ async def check_flow() -> None:
     ok(await db.count_players(gid) == 9, "9 участников")
     await giveaways._refresh_counters(bot)
     ok(any("· 9" in str(e["reply_markup"]) for e in bot.edits), "счётчик на кнопке обновился")
+    ok({e["chat_id"] for e in bot.edits if "· 9" in str(e["reply_markup"])} == {CHANNEL, SPONSOR},
+       "счётчик обновился и у спонсора")
 
     queue = draw.order(seed, [p["user_id"] for p in await db.players(gid)])
     deserter = queue[0]
@@ -171,6 +176,9 @@ async def check_flow() -> None:
     results = [s for s in bot.sent if s[1] == CHANNEL]
     ok(results and seed in results[0][2], "итоги в канале с раскрытым сидом")
     ok(results[0][3]["reply_parameters"].message_id == row["message_id"], "итоги ответом на пост")
+    ok(any(s[1] == SPONSOR and seed in (s[2] or "") for s in bot.sent), "итоги вышли и у спонсора")
+    ok(any(e["chat_id"] == SPONSOR and "https://t.me/sponsor/" in str(e["reply_markup"]) for e in bot.edits),
+       "кнопка копии ведёт на итоги в канале спонсора")
     ok(any(s[1] == OWNER for s in bot.sent), "владелец получил итоги")
     ok(sum(1 for s in bot.sent if s[1] in res["winners"]) == 3, "победителям ушло по сообщению")
     ok(any("https://t.me/solutions/" in str(e["reply_markup"]) for e in bot.edits),
@@ -180,6 +188,28 @@ async def check_flow() -> None:
     ok(extra is not None and extra["user_id"] == queue[4], "доп. победитель — следующий в очереди")
     res = db.result(await db.get(gid))
     ok(len(set(res["winners"])) == 4 and deserter not in res["winners"], "доп. победитель не повторяет старых")
+
+    ok(sum(1 for s in bot.sent if s[1] in (CHANNEL, SPONSOR) and "дополнительный" in (s[2] or "")) == 2,
+       "доп. победитель объявлен в обоих каналах")
+
+    print("копия без прав")
+    seed3 = draw.new_seed()
+    gid3 = await db.create({
+        "owner_id": OWNER, "chat_id": CHANNEL, "chat_title": "Solutions", "chat_username": None,
+        "text": "третий", "winners": 1, "publish_at": db.now() - 1, "end_at": db.now() + 999,
+        "seed": seed3, "seed_hash": draw.fingerprint(seed3),
+    }, [{"chat_id": SPONSOR, "title": "Спонсор", "username": "sponsor", "post": True}])
+    real_send = bot.send_message
+
+    async def picky(chat_id, text, **kw):
+        if chat_id == SPONSOR:
+            raise RuntimeError("нет прав")
+        return await real_send(chat_id, text, **kw)
+    bot.send_message = picky
+    ok(await giveaways.publish(bot, gid3), "отказ спонсора не валит розыгрыш")
+    ok((await db.get(gid3))["status"] == "active", "основной пост идёт")
+    ok(any(s[1] == OWNER and "не вышел" in s[2] for s in bot.sent), "владелец узнал про отказ спонсора")
+    bot.send_message = real_send
 
     print("сбой посреди итогов")
     seed2 = draw.new_seed()
@@ -212,6 +242,21 @@ async def check_flow() -> None:
     await db.close()
 
 
+async def check_migration() -> None:
+    print("старая база")
+    import aiosqlite
+    path = Path(os.environ["DATA_DIR"]) / "old.db"
+    async with aiosqlite.connect(path) as old:
+        await old.execute("CREATE TABLE subs (giveaway_id INTEGER, chat_id INTEGER, title TEXT, "
+                          "username TEXT, PRIMARY KEY (giveaway_id, chat_id))")
+        await old.execute("INSERT INTO subs VALUES (1, -100, 'старый', NULL)")
+        await old.commit()
+    await db.connect(path)
+    rows = await db.subs(1)
+    ok(len(rows) == 1 and rows[0]["post"] == 0, "колонка post добавилась, старые подписки на месте")
+    await db.close()
+
+
 def check_imports() -> None:
     print("сборка")
     import handlers  # noqa: F401
@@ -240,6 +285,7 @@ def main() -> None:
     check_time()
     check_draw()
     asyncio.run(check_flow())
+    asyncio.run(check_migration())
     check_imports()
     print()
     if failures:

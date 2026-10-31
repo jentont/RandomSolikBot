@@ -43,6 +43,7 @@ import wizard  # noqa: E402
 ME = 123456789
 BOT_ID = 42
 CHANNEL = -1001234567890
+SPONSOR = -1007777777777
 failures: list[str] = []
 
 
@@ -83,6 +84,10 @@ class FakeSession(BaseSession):
         if isinstance(method, methods.GetChat):
             # construct без проверки: обязательные поля ChatFullInfo
             # меняются от версии к версии, а боту нужны только эти.
+            if isinstance(method.chat_id, str):
+                # «@novostislavika» — спонсор, присланный по имени.
+                return ChatFullInfo.model_construct(id=SPONSOR, type="channel",
+                                                    title="Новости", username=method.chat_id.lstrip("@"))
             return ChatFullInfo.model_construct(id=method.chat_id, type="channel",
                                                 title="Solutions", username="solutions")
         if isinstance(method, methods.GetChatMember):
@@ -158,12 +163,17 @@ async def run() -> None:
     out = await step(press("w:own"))
     ok("без обязательных" in out, "подписку на свой канал можно выключить")
     await step(press("w:own"))
+    ok("не нашёл" in await step(msg("какой-то текст")), "мусор вместо канала — переспрос")
+    ok("добавил" in await step(msg("https://t.me/novostislavika")), "спонсор добавлен ссылкой")
+    out = await step(press(f"w:post:{SPONSOR}"))
+    ok("пост" in out and "Новости" in out, "у спонсора включён пост")
     ok("шаг 5 из 6" in await step(press("w:subdone")), "шаг 5: публикация")
     ok("не понял" in await step(msg("когда-нибудь")), "непонятное время — переспрос")
     ok("шаг 6 из 6" in await step(press("w:pub:now")), "«сейчас» → шаг 6")
     ok("хотя бы через 5" in await step(msg("1м")), "итоги через минуту — слишком рано")
     out = await step(press("w:end:86400"))
     ok("проверь" in out and "дарим" in out, "предпросмотр поста и сводка")
+    ok("пост выйдет в" in out and "novostislavika" in out, "в сводке видно, что пост выйдет и у спонсора")
     ok("отпечаток" in out, "в предпросмотре видна строка с отпечатком")
     preview = [c for c in session.calls if isinstance(c, methods.SendPhoto) and c.chat_id == ME]
     ok(preview and preview[-1].photo == "PHOTO", "предпросмотр с той же картинкой")
@@ -172,11 +182,14 @@ async def run() -> None:
     await dp.feed_update(bot, press("w:go"))
     posted = [c for c in session.calls[mark:] if isinstance(c, methods.SendPhoto) and c.chat_id == CHANNEL]
     ok(len(posted) == 1, "по «опубликовать» пост ушёл в канал один раз")
+    mirrored = [c for c in session.calls[mark:] if isinstance(c, methods.SendPhoto) and c.chat_id == SPONSOR]
+    ok(len(mirrored) == 1, "и копия ушла к спонсору")
     row = (await db.by_owner(ME, 0, 1))[0]
     ok(row["status"] == "active" and row["winners"] == 2, "розыгрыш идёт, 2 победителя")
     ok(85000 < row["end_at"] - row["publish_at"] < 87000, "итоги через сутки от публикации")
     subs = await db.subs(row["id"])
-    ok([s["chat_id"] for s in subs] == [CHANNEL], "обязательная подписка — свой канал")
+    ok([s["chat_id"] for s in subs] == [CHANNEL, SPONSOR], "подписки: свой канал и спонсор")
+    ok([s["post"] for s in subs] == [0, 1], "пост отмечен только у спонсора")
 
     print("мои розыгрыши")
     out = await step(msg(texts.BTN_MY))

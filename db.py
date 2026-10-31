@@ -60,6 +60,16 @@ CREATE TABLE IF NOT EXISTS subs (
     username    TEXT,
     PRIMARY KEY (giveaway_id, chat_id)
 );
+-- Копии поста розыгрыша в каналах спонсоров. Основной пост живёт в
+-- giveaways.message_id, здесь только дополнительные.
+CREATE TABLE IF NOT EXISTS posts (
+    giveaway_id INTEGER,
+    chat_id     INTEGER,
+    message_id  INTEGER,
+    title       TEXT,
+    username    TEXT,
+    PRIMARY KEY (giveaway_id, chat_id)
+);
 CREATE TABLE IF NOT EXISTS players (
     giveaway_id INTEGER,
     user_id     INTEGER,
@@ -81,6 +91,11 @@ async def connect(path=None) -> None:
     _db.row_factory = aiosqlite.Row
     await _db.execute("PRAGMA journal_mode=WAL")
     await _db.executescript(SCHEMA)
+    # Базы, созданные до копий поста, не знают колонки subs.post. ALTER
+    # вместо пересоздания: на хостинге уже идут розыгрыши с участниками.
+    async with _db.execute("PRAGMA table_info(subs)") as cur:
+        if "post" not in {row[1] for row in await cur.fetchall()}:
+            await _db.execute("ALTER TABLE subs ADD COLUMN post INTEGER DEFAULT 0")
     await _db.commit()
 
 
@@ -157,8 +172,8 @@ async def create(data: dict[str, Any], subs: list[dict[str, Any]]) -> int:
     gid = cur.lastrowid
     for sub in subs:
         await _conn().execute(
-            "INSERT OR IGNORE INTO subs(giveaway_id, chat_id, title, username) VALUES (?,?,?,?)",
-            (gid, sub["chat_id"], sub["title"], sub.get("username")),
+            "INSERT OR IGNORE INTO subs(giveaway_id, chat_id, title, username, post) VALUES (?,?,?,?,?)",
+            (gid, sub["chat_id"], sub["title"], sub.get("username"), int(bool(sub.get("post")))),
         )
     await _conn().commit()
     return gid
@@ -220,6 +235,17 @@ def result(row) -> dict[str, Any]:
 
 async def subs(gid: int) -> list[aiosqlite.Row]:
     return await _all("SELECT * FROM subs WHERE giveaway_id=? ORDER BY rowid", gid)
+
+
+async def add_post(gid: int, chat_id: int, message_id: int, title: str, username: str | None) -> None:
+    await _run(
+        "INSERT OR REPLACE INTO posts(giveaway_id, chat_id, message_id, title, username) VALUES (?,?,?,?,?)",
+        gid, chat_id, message_id, title, username,
+    )
+
+
+async def posts(gid: int) -> list[aiosqlite.Row]:
+    return await _all("SELECT * FROM posts WHERE giveaway_id=? ORDER BY rowid", gid)
 
 
 # --- участники --------------------------------------------------------

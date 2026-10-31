@@ -104,10 +104,13 @@ def winners() -> InlineKeyboardMarkup:
     ])
 
 
-def subs(own_on: bool, own_title: str, extra: int) -> InlineKeyboardMarkup:
+def subs(own_on: bool, own_title: str, extras: list[dict]) -> InlineKeyboardMarkup:
     mark = "✓" if own_on else "○"
     rows = [[_btn(f"{mark} подписка на {own_title}"[:60], "w:own")]]
-    if extra:
+    for sub in extras:
+        post = "✓" if sub.get("post") else "○"
+        rows.append([_btn(f"{post} пост и в {sub['title']}"[:60], f"w:post:{sub['chat_id']}")])
+    if extras:
         rows.append([_btn("убрать добавленные", "w:subclear")])
     rows.append([_btn("дальше →", "w:subdone")])
     return InlineKeyboardMarkup(inline_keyboard=rows)

@@ -151,7 +151,8 @@ async def join(call: CallbackQuery, bot: Bot) -> None:
 def _subs_line(subs) -> str:
     if not subs:
         return texts.SUBS_NONE
-    return ", ".join(texts.chat_link(s["title"], s["username"]) for s in subs)
+    mark = texts.t(texts.SUB_POST_MARK)
+    return ", ".join(texts.chat_link(s["title"], s["username"]) + (mark if s["post"] else "") for s in subs)
 
 
 def _preview(row, limit: int = 300) -> str:
