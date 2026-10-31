@@ -199,6 +199,15 @@ async def my_list(message: Message) -> None:
     await _show_list(message, message.from_user.id, 0, edit=False)
 
 
+async def _mirrorable(row) -> list:
+    if row["status"] not in {"scheduled", "active"}:
+        return []
+    posted = {p["chat_id"] for p in await db.posts(row["id"])}
+    return [s for s in await db.subs(row["id"])
+            if s["chat_id"] != row["chat_id"] and s["chat_id"] not in posted
+            and not (row["status"] == "scheduled" and s["post"])]
+
+
 async def _own(call: CallbackQuery, gid: int):
     row = await db.get(gid)
     if row is None or row["owner_id"] != call.from_user.id:
@@ -220,14 +229,14 @@ async def my_actions(call: CallbackQuery, bot: Bot) -> None:
     if row is None:
         return
 
-    async def show(row=None, note: str | None = None) -> None:
+    async def show(row=None, note: str | None = None, alert: bool = False) -> None:
         row = row or await db.get(gid)
         try:
-            await call.message.edit_text(await card_text(row), reply_markup=keyboards.card(row, page),
+            await call.message.edit_text(await card_text(row), reply_markup=keyboards.card(row, page, await _mirrorable(row)),
                                          link_preview_options={"is_disabled": True})
         except TelegramBadRequest:
             pass
-        await call.answer(note or "")
+        await call.answer(note or "", show_alert=alert)
 
     if action == "open":
         await show(row)
@@ -240,6 +249,9 @@ async def my_actions(call: CallbackQuery, bot: Bot) -> None:
         await call.answer("подвожу итоги…")
         await giveaways.finish(bot, gid)
         await show()
+    elif action == "mirror":
+        note = await giveaways.mirror_now(bot, gid, int(parts[4]), call.from_user.id)
+        await show(note=note[:200], alert=True)
     elif action == "cancel!":
         ok = await db.claim(gid, "scheduled", "cancelled")
         await show(note=None if ok else "уже не отменить — он вышел")

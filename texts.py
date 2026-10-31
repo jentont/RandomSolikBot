@@ -196,6 +196,11 @@ SUB_NOT_ADMIN = (
 )
 POST_NO_RIGHTS = "в {title} я не могу публиковать — нужно право «публикация сообщений»"
 POST_NOT_YOURS = "ты не админ в {title} — выкладывать туда пост может только его админ"
+MIRROR_DONE = "выложил в {title}! кнопка там общая, участники тоже"
+MIRROR_LATER = "ок, пост выйдет и в {title} вместе с основным"
+MIRROR_ALREADY = "там пост уже есть"
+MIRROR_UNKNOWN = "этого канала нет в подписках розыгрыша"
+MIRROR_FAIL = "не вышло выложить в {title}: {error}"
 SUB_POST_MARK = " · {e:megaphone} пост"
 STEP_PUBLISH = (
     "{e:calendar} <b>шаг 5 из 6</b> · когда опубликовать?\n\n"

@@ -132,6 +132,53 @@ async def _publish_mirrors(bot: Bot, row) -> None:
         await db.add_post(gid, sub["chat_id"], message.message_id, sub["title"], sub["username"])
 
 
+async def can_mirror(bot: Bot, chat_id: int, user_id: int, title: str) -> str | None:
+    """None — можно выкладывать. Иначе текст, почему нельзя.
+
+    Выкладывать в канал может только его админ: иначе любой пользователь
+    бота постил бы розыгрыши в чужой канал, где солик админ ради проверки
+    подписки."""
+    try:
+        me = await bot.get_chat_member(chat_id, bot.id)
+        human = await bot.get_chat_member(chat_id, user_id)
+    except TelegramBadRequest:
+        return texts.POST_NO_RIGHTS.format(title=title)
+    if not (me.status == "creator" or (me.status == "administrator" and getattr(me, "can_post_messages", False))):
+        return texts.POST_NO_RIGHTS.format(title=title)
+    if human.status not in {"administrator", "creator"}:
+        return texts.POST_NOT_YOURS.format(title=title)
+    return None
+
+
+async def mirror_now(bot: Bot, gid: int, chat_id: int, user_id: int) -> str:
+    """Выложить розыгрыш ещё в один канал из его подписок. Текст для всплывашки.
+
+    Идущий — копия уходит сразу, с текущим счётчиком. Запланированный —
+    только отметка: копия выйдет вместе с основным постом."""
+    row = await db.get(gid)
+    sub = next((s for s in await db.subs(gid) if s["chat_id"] == chat_id), None)
+    if row is None or sub is None or chat_id == row["chat_id"]:
+        return texts.MIRROR_UNKNOWN
+    if any(p["chat_id"] == chat_id for p in await db.posts(gid)):
+        return texts.MIRROR_ALREADY
+    problem = await can_mirror(bot, chat_id, user_id, sub["title"])
+    if problem:
+        return problem
+    await db.set_sub_post(gid, chat_id)
+    if row["status"] == "scheduled":
+        return texts.MIRROR_LATER.format(title=sub["title"])
+    if row["status"] != "active":
+        return texts.JOIN_CLOSED
+    try:
+        message = await send_post(bot, chat_id, compose_post(row), row["media_type"], row["media_id"],
+                                  keyboards.join(gid, await db.count_players(gid)))
+    except Exception as error:
+        log.warning("копия #%s в %s не вышла: %s", gid, chat_id, error)
+        return texts.MIRROR_FAIL.format(title=sub["title"], error=str(error)[:120])
+    await db.add_post(gid, chat_id, message.message_id, sub["title"], sub["username"])
+    return texts.MIRROR_DONE.format(title=sub["title"])
+
+
 async def all_posts(row) -> list[dict]:
     """Все посты розыгрыша: основной первым, потом копии у спонсоров."""
     out = [{"chat_id": row["chat_id"], "message_id": row["message_id"],

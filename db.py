@@ -244,6 +244,10 @@ async def add_post(gid: int, chat_id: int, message_id: int, title: str, username
     )
 
 
+async def set_sub_post(gid: int, chat_id: int) -> None:
+    await _run("UPDATE subs SET post=1 WHERE giveaway_id=? AND chat_id=?", gid, chat_id)
+
+
 async def posts(gid: int) -> list[aiosqlite.Row]:
     return await _all("SELECT * FROM posts WHERE giveaway_id=? ORDER BY rowid", gid)
 

@@ -266,21 +266,9 @@ async def toggle_post(call: CallbackQuery, state: FSMContext, bot: Bot) -> None:
         await call.answer()
         return
     if not sub.get("post"):
-        # Выкладывать пост в канал может только его админ: иначе любой
-        # пользователь бота постил бы розыгрыши в чужой канал, где солик
-        # оказался админом ради проверки подписки.
-        title = sub["title"]
-        try:
-            me = await bot.get_chat_member(chat_id, bot.id)
-            human = await bot.get_chat_member(chat_id, call.from_user.id)
-        except TelegramBadRequest:
-            await call.answer(texts.POST_NO_RIGHTS.format(title=title)[:200], show_alert=True)
-            return
-        if not (me.status == "creator" or (me.status == "administrator" and getattr(me, "can_post_messages", False))):
-            await call.answer(texts.POST_NO_RIGHTS.format(title=title)[:200], show_alert=True)
-            return
-        if human.status not in {"administrator", "creator"}:
-            await call.answer(texts.POST_NOT_YOURS.format(title=title)[:200], show_alert=True)
+        problem = await giveaways.can_mirror(bot, chat_id, call.from_user.id, sub["title"])
+        if problem:
+            await call.answer(problem[:200], show_alert=True)
             return
     sub["post"] = not sub.get("post")
     await state.update_data(extra=extra)

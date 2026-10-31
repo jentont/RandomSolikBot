@@ -69,7 +69,8 @@ class FakeBot:
         self.edits.append(kw)
 
     async def get_chat_member(self, chat_id, user_id):
-        return SimpleNamespace(status=self.members.get((chat_id, user_id), "left"), is_member=False)
+        return SimpleNamespace(status=self.members.get((chat_id, user_id), "left"), is_member=False,
+                               can_post_messages=True)
 
 
 def user(uid: int, bot=False):
@@ -210,6 +211,27 @@ async def check_flow() -> None:
     ok((await db.get(gid3))["status"] == "active", "основной пост идёт")
     ok(any(s[1] == OWNER and "не вышел" in s[2] for s in bot.sent), "владелец узнал про отказ спонсора")
     bot.send_message = real_send
+
+    print("выложить у спонсора уже идущий")
+    seed4 = draw.new_seed()
+    gid4 = await db.create({
+        "owner_id": OWNER, "chat_id": CHANNEL, "chat_title": "Solutions", "chat_username": None,
+        "text": "четвёртый", "winners": 1, "publish_at": db.now() - 1, "end_at": db.now() + 999,
+        "seed": seed4, "seed_hash": draw.fingerprint(seed4),
+    }, [{"chat_id": SPONSOR, "title": "Спонсор", "username": "sponsor"}])
+    await giveaways.publish(bot, gid4)
+    ok(not await db.posts(gid4), "без отметки копия не выходит")
+    await db.join(gid4, 1, "a", None)
+    ok("не могу публиковать" in await giveaways.mirror_now(bot, gid4, SPONSOR, OWNER),
+       "без админки бота в канале — понятный отказ")
+    bot.members[(SPONSOR, FakeBot.id)] = "administrator"
+    ok("не админ" in await giveaways.mirror_now(bot, gid4, SPONSOR, 555), "чужой не может выложить в канал спонсора")
+    bot.members[(SPONSOR, OWNER)] = "administrator"
+    ok("выложил" in await giveaways.mirror_now(bot, gid4, SPONSOR, OWNER), "админ канала выложил уже идущий розыгрыш")
+    last = [s for s in bot.sent if s[1] == SPONSOR][-1]
+    ok("· 1" in str(last[3]["reply_markup"]), "копия сразу с текущим счётчиком")
+    ok(await giveaways.mirror_now(bot, gid4, SPONSOR, OWNER) == texts.MIRROR_ALREADY, "второй раз не дублирует")
+    ok([s["post"] for s in await db.subs(gid4)] == [1], "отметка поста сохранена")
 
     print("сбой посреди итогов")
     seed2 = draw.new_seed()

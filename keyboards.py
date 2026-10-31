@@ -163,9 +163,13 @@ def my_list(rows, page: int, total: int, per_page: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
 
-def card(row, page: int) -> InlineKeyboardMarkup:
+def card(row, page: int, mirrorable=()) -> InlineKeyboardMarkup:
+    """mirrorable — каналы из подписок, где поста розыгрыша ещё нет."""
     gid, status = row["id"], row["status"]
     kb = []
+    if status in {"scheduled", "active"}:
+        for sub in mirrorable:
+            kb.append([_btn(f"выложить и в {sub['title']}"[:60], f"my:mirror:{gid}:{page}:{sub['chat_id']}")])
     if status == "scheduled":
         kb.append([_btn("опубликовать сейчас", f"my:pubnow:{gid}:{page}")])
         kb.append([_btn("отменить", f"my:cancel:{gid}:{page}")])
